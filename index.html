@@ -478,178 +478,227 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
 
   /* ---------------- PDF parsing ---------------- */
 
-  // Matches the closing punctuation of a completed sentence/paragraph (Latin quotes included).
-  const SENTENCE_END_RE = /[.!?…»”"'’]\s*$/;
+  // PDF text is positional, not paragraph-based. We reconstruct visual lines
+  // first, then paragraphs. This avoids losing dialogue and avoids treating
+  // punctuation/page breaks as hard paragraph boundaries.
+  const SENTENCE_END_RE = /[.!?…»”"’']\s*$/;
+
+  function cleanText(text){
+    return String(text || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[ \t]+/g, ' ')
+      .trim();
+  }
 
   function splitSentences(paragraph){
-    const matches = paragraph.match(/[^.!?…]+(?:[.!?…]+(?=\s|$)|$)/g);
-    if(!matches) return [paragraph.trim()];
-    return matches.map(s => s.trim()).filter(Boolean);
+    const text = cleanText(paragraph);
+    if(!text) return [];
+
+    const out = [];
+    let start = 0;
+    let quoteDepth = 0;
+
+    for(let i = 0; i < text.length; i++){
+      const c = text[i];
+      if(c === '“' || c === '«' || c === '‘' || c === '「') quoteDepth++;
+      else if(c === '”' || c === '»' || c === '’' || c === '」') quoteDepth = Math.max(0, quoteDepth - 1);
+      if(quoteDepth) continue;
+
+      if(/[.!?…]/.test(c)){
+        let j = i + 1;
+        while(j < text.length && /[.!?…]/.test(text[j])) j++;
+        while(j < text.length && /["'”»’]/.test(text[j])) j++;
+        if(j >= text.length || /\s/.test(text[j])){
+          const part = text.slice(start, j).trim();
+          if(part) out.push(part);
+          start = j;
+          i = j - 1;
+        }
+      }
+    }
+    const tail = text.slice(start).trim();
+    if(tail) out.push(tail);
+    return out.length ? out : [text];
   }
 
   function linesToParagraphs(lines){
     const paras = [];
-    let cur = [];
-    lines.forEach(ln => {
-      if(ln.newParagraph && cur.length){
-        paras.push(cur.join(' '));
-        cur = [];
+    let cur = '';
+    for(const ln of lines){
+      const text = cleanText(ln.text);
+      if(!text) continue;
+      if(ln.newParagraph && cur){
+        paras.push(cur.trim());
+        cur = '';
       }
-      cur.push(ln.text);
-    });
-    if(cur.length) paras.push(cur.join(' '));
+      cur += (cur ? ' ' : '') + text;
+    }
+    if(cur.trim()) paras.push(cur.trim());
     return paras.map(p => p.replace(/\s+/g,' ').trim()).filter(p => p.length > 1);
   }
 
-  // Detects "Capítulo N" / "Chapter N" style headings and tells real chapter
-  // starts apart from an index/table-of-contents dump (many heading-like lines
-  // in a row with no real prose between them).
+  function isChapterHeading(text){
+    return /^(cap[ií]tulo|chapter|cap\.)\s*[:\-]?\s*(\d{1,5})\b/i.test(text.trim());
+  }
+
   function detectChapters(lines){
-    const headingRegex = /^(cap[ií]tulo|chapter|cap\.)\s*[:\-]?\s*(\d{1,4})\b/i;
     const candidates = [];
-    lines.forEach((ln, idx) => {
-      if(headingRegex.test(ln.text.trim())) candidates.push(idx);
-    });
+    lines.forEach((ln, i) => { if(isChapterHeading(ln.text)) candidates.push(i); });
     if(!candidates.length) return null;
 
     const real = [];
-    for(let i = 0; i < candidates.length; i++){
-      const start = candidates[i];
-      const end = i + 1 < candidates.length ? candidates[i+1] : lines.length;
-      let proseWeight = 0;
-      for(let j = start + 1; j < end; j++){
-        proseWeight += lines[j].text.length;
+    for(let i=0;i<candidates.length;i++){
+      const a=candidates[i], b=i+1<candidates.length?candidates[i+1]:lines.length;
+      let weight=0, count=0;
+      for(let j=a+1;j<b;j++){
+        const t=cleanText(lines[j].text);
+        if(t){ weight+=t.length; count++; }
       }
-      if(proseWeight > 220) real.push(start);
+      // TOC heading clusters have little prose. Do not discard a short real
+      // chapter merely because it is shorter than the old 220-char cutoff.
+      if(weight >= 120 && count >= 2) real.push(a);
     }
     if(!real.length) return null;
 
-    const chapters = [];
-    for(let i = 0; i < real.length; i++){
-      const start = real[i];
-      const end = i + 1 < real.length ? real[i+1] : lines.length;
-      chapters.push({
-        title: lines[start].text.trim(),
-        bodyLines: lines.slice(start + 1, end),
-      });
+    return real.map((a,i)=>({
+      title: cleanText(lines[a].text),
+      bodyLines: lines.slice(a+1, i+1<real.length ? real[i+1] : lines.length)
+    }));
+  }
+
+  function groupPageItemsIntoLines(items, pageIndex){
+    const parts=items.filter(x=>x.str && x.str.trim()).map(item=>{
+      const t=item.transform || [1,0,0,1,0,0];
+      return {
+        item,
+        x:Number(t[4])||0,
+        y:Number(t[5])||0,
+        h:Math.abs(Number(item.height)||Number(t[3])||12),
+        pageIndex
+      };
+    });
+    parts.sort((a,b)=>Math.abs(a.y-b.y)>2 ? b.y-a.y : a.x-b.x);
+
+    const lines=[];
+    for(const part of parts){
+      const tol=Math.max(2.5,part.h*0.30);
+      let line=null;
+      for(let i=lines.length-1;i>=0;i--){
+        if(Math.abs(part.y-lines[i].y)<=tol){ line=lines[i]; break; }
+        if(lines[i].y-part.y>tol*2) break;
+      }
+      if(!line) lines.push({x:part.x,y:part.y,h:part.h,parts:[part.item],pageIndex});
+      else { line.parts.push(part.item); line.x=Math.min(line.x,part.x); line.h=Math.max(line.h,part.h); }
     }
-    return chapters;
+    lines.sort((a,b)=>Math.abs(a.y-b.y)>2 ? b.y-a.y : a.x-b.x);
+    return lines;
+  }
+
+  function markParagraphs(pageLines, previous){
+    const out=[];
+    let prev=previous || null;
+    for(let i=0;i<pageLines.length;i++){
+      const ln=pageLines[i];
+      const text=cleanText(ln.parts.map(x=>x.str).join(''));
+      if(!text) continue;
+      let newParagraph=false;
+      if(!prev) newParagraph=true;
+      else if(ln.pageIndex!==prev.pageIndex){
+        // Page breaks do not imply paragraphs. Preserve continuation text.
+        newParagraph=(ln.x-prev.x)>Math.max(8,ln.h*0.8);
+      }else{
+        const gap=Math.abs(prev.y-ln.y);
+        const ref=Math.max(prev.h||12,ln.h||12);
+        const indent=(ln.x-prev.x)>Math.max(10,ref*0.85);
+        newParagraph=gap>ref*1.65 || indent || (SENTENCE_END_RE.test(prev.text) && gap>ref*1.25);
+      }
+      const row={text,x:ln.x,y:ln.y,h:ln.h,pageIndex:ln.pageIndex,newParagraph};
+      out.push(row); prev=row;
+    }
+    return out;
   }
 
   async function processPdfFile(file){
-    setStatus('Lendo PDF e separando capítulos...', '');
+    setStatus('Lendo PDF e reconstruindo a formatação...', '');
     try{
-      const buf = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-      const totalPages = pdf.numPages;
-      const allLines = [];
-      let prevLineText = "";
+      const buf=await file.arrayBuffer();
+      const pdf=await pdfjsLib.getDocument({data:buf}).promise;
+      const totalPages=pdf.numPages;
+      const pageSets=[];
+      const allLines=[];
+      let previous=null;
 
-      for(let p = 1; p <= totalPages; p++){
-        const page = await pdf.getPage(p);
-        const content = await page.getTextContent();
-        const items = content.items;
+      for(let p=1;p<=totalPages;p++){
+        const page=await pdf.getPage(p);
+        const content=await page.getTextContent({normalizeWhitespace:false,disableCombineTextItems:false});
+        const visual=groupPageItemsIntoLines(content.items,p);
+        const marked=markParagraphs(visual,previous);
+        if(marked.length) previous=marked[marked.length-1];
+        pageSets.push({pageIndex:p,lines:marked});
+        allLines.push(...marked);
+      }
 
-        // Group text items into visual lines by y-position, tracking each
-        // line's font height so paragraph breaks can be judged in absolute
-        // terms instead of relative to the page's overall gap statistics
-        // (which breaks down on dialogue-heavy pages with many short lines).
-        const lines = [];
-        let lastY = null;
-        items.forEach(item => {
-          if(!item.str || !item.str.trim()) return;
-          const y = item.transform[5];
-          const h = item.height || Math.abs(item.transform[3]) || 12;
-          if(lastY === null || Math.abs(y - lastY) > 2){
-            lines.push({ y, h, parts: [item.str] });
-            lastY = y;
-          } else {
-            const cur = lines[lines.length - 1];
-            cur.parts.push(item.str);
-            cur.h = Math.max(cur.h, h);
-          }
-        });
+      if(!allLines.length) throw new Error('não foi possível extrair texto (o PDF pode ser uma imagem escaneada)');
 
-        lines.forEach((ln, idx) => {
-          const text = ln.parts.join(' ').replace(/\s+/g,' ').trim();
-          if(!text) return;
-
-          let isNewParagraph;
-          if(idx === 0){
-            // First line of a page: only a new paragraph if the previous
-            // page's last line actually finished a sentence.
-            isNewParagraph = allLines.length > 0 && SENTENCE_END_RE.test(prevLineText);
-          } else {
-            const prevLn = lines[idx - 1];
-            const prevText = prevLn.parts.join(' ').trim();
-            const gap = Math.abs(prevLn.y - ln.y);
-            const refHeight = prevLn.h || ln.h || 12;
-            const endsSentence = SENTENCE_END_RE.test(prevText);
-            // Clear vertical gap (blank line) -> new paragraph. A smaller
-            // gap still counts if the previous line already ended a
-            // sentence, which is what separates short dialogue lines.
-            isNewParagraph = gap > refHeight * 1.45 || (endsSentence && gap > refHeight * 1.15);
-          }
-
-          allLines.push({ text, newParagraph: isNewParagraph });
-          prevLineText = text;
+      // Remove only obvious headers/footers and page numbers at page edges.
+      // The old frequency filter could delete legitimate repeated prose.
+      const filtered=[];
+      for(const page of pageSets){
+        if(!page.lines.length) continue;
+        const ys=page.lines.map(l=>l.y), maxY=Math.max(...ys), minY=Math.min(...ys);
+        const span=Math.max(1,maxY-minY);
+        page.lines.forEach(line=>{
+          const t=cleanText(line.text);
+          const nearTop=(maxY-line.y)<span*0.07;
+          const nearBottom=(line.y-minY)<span*0.07;
+          const junk=/central\s*novel/i.test(t)||/cap[ií]tulo\s*anterior/i.test(t)||/pr[oó]ximo\s*cap[ií]tulo/i.test(t)||/publicidade/i.test(t)||/compartilhe/i.test(t)||/traduzido\s*pelo\s*chatgpt/i.test(t);
+          if(junk) return;
+          if(/^\d{1,4}$/.test(t) && (nearTop||nearBottom)) return;
+          filtered.push(line);
         });
       }
 
-      // remove running headers/footers repeated across most pages, and stray page numbers
-      const freq = {};
-      allLines.forEach(l => { freq[l.text] = (freq[l.text] || 0) + 1; });
-      const threshold = Math.max(2, Math.floor(totalPages * 0.5));
-      const junkExact = new Set(Object.keys(freq).filter(t => totalPages > 2 && freq[t] >= threshold));
-      const junkPatterns = [
-        /central\s*novel/i, /cap[ií]tulo\s*anterior/i, /pr[oó]ximo\s*cap[ií]tulo/i,
-        /publicidade/i, /compartilhe/i, /^\d{1,4}$/,
-        /traduzido\s*pelo\s*chatgpt/i,
-      ];
-      const filtered = allLines.filter(l => {
-        if(junkExact.has(l.text)) return false;
-        if(l.text.length < 30 && junkPatterns.some(rx => rx.test(l.text))) return false;
-        return true;
-      });
-
-      const detected = detectChapters(filtered);
+      const detected=detectChapters(filtered);
       let chaptersRaw;
       if(detected && detected.length){
-        chaptersRaw = detected.map(ch => {
-          const rawParas = linesToParagraphs(ch.bodyLines);
-          const paragraphs = rawParas.map(p => splitSentences(p)).filter(a => a.length);
-          return { title: ch.title, paragraphs };
-        }).filter(ch => ch.paragraphs.length > 0);
-      } else {
-        let title = "";
+        chaptersRaw=detected.map(ch=>({
+          title:ch.title,
+          paragraphs:linesToParagraphs(ch.bodyLines).map(splitSentences).filter(a=>a.length)
+        })).filter(ch=>ch.paragraphs.length);
+      }else{
+        let title='';
         try{
-          const meta = await pdf.getMetadata();
-          if(meta && meta.info && meta.info.Title && meta.info.Title.trim().length > 2 && meta.info.Title.length < 120){
-            title = meta.info.Title.trim();
-          }
+          const meta=await pdf.getMetadata();
+          const mt=meta&&meta.info&&typeof meta.info.Title==='string'?meta.info.Title.trim():'';
+          if(mt.length>2 && mt.length<120) title=mt;
         }catch(e){}
-        if(!title) title = file.name.replace(/\.pdf$/i,'').replace(/[_\-]+/g,' ').trim();
-        const rawParas = linesToParagraphs(filtered);
-        chaptersRaw = [{ title, paragraphs: rawParas.map(p => splitSentences(p)).filter(a => a.length) }];
+        if(!title) title=file.name.replace(/\.pdf$/i,'').replace(/[_\-]+/g,' ').trim();
+        chaptersRaw=[{title,paragraphs:linesToParagraphs(filtered).map(splitSentences).filter(a=>a.length)}];
       }
 
-      if(!chaptersRaw.length || !chaptersRaw.some(c => c.paragraphs.length)){
-        throw new Error('não foi possível extrair texto (o PDF pode ser uma imagem escaneada)');
+      // Safety net against false chapter headings cutting off the tail.
+      const extractedChars=chaptersRaw.reduce((n,ch)=>n+ch.paragraphs.reduce((m,a)=>m+a.join(' ').length,0),0);
+      const fallbackParas=linesToParagraphs(filtered);
+      const fallbackChars=fallbackParas.join(' ').length;
+      if(fallbackChars>extractedChars*1.25 && fallbackChars-extractedChars>500){
+        chaptersRaw=[{
+          title:(chaptersRaw[0]&&chaptersRaw[0].title)||file.name.replace(/\.pdf$/i,''),
+          paragraphs:fallbackParas.map(splitSentences).filter(a=>a.length)
+        }];
       }
 
-      state.volume = chaptersRaw;
+      if(!chaptersRaw.length || !chaptersRaw.some(c=>c.paragraphs.length)) throw new Error('não foi possível extrair texto (o PDF pode ser uma imagem escaneada)');
+
+      state.volume=chaptersRaw;
       saveVolume();
       renderChapterList();
-      goToChapter(0, false);
-
-      const n = chaptersRaw.length;
-      setStatus(
-        n > 1 ? n + ' capítulos encontrados ✓ (índice ignorado)' : 'Capítulo carregado ✓',
-        'ok'
-      );
+      goToChapter(0,false);
+      const n=chaptersRaw.length;
+      setStatus(n>1 ? n+' capítulos encontrados ✓ (índice ignorado)' : 'Capítulo carregado ✓','ok');
       closeDrawer();
     }catch(err){
-      setStatus('Erro ao ler PDF: ' + (err.message || err), 'err');
+      console.error("Reader's Companion PDF parser:",err);
+      setStatus('Erro ao ler PDF: '+(err.message||err),'err');
     }
   }
 
