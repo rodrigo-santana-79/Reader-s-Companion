@@ -300,8 +300,8 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
   <div class="dsection">
     <h3>Volume</h3>
     <label class="upload-zone" for="pdfInput">
-      <div class="u-title">Enviar PDF do volume</div>
-      <div class="u-sub">o índice é ignorado automaticamente<br>e os capítulos são separados sozinhos</div>
+      <div class="u-title">Enviar arquivo em .PDF</div>
+      <div class="u-sub">Eu vou lê-lo assim que me mandar<br>e vou separar os capítulos para você.</div>
       <input type="file" id="pdfInput" accept="application/pdf">
     </label>
     <div class="d-status" id="dStatus"></div>
@@ -338,8 +338,10 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
   <div id="readerContent">
     <div class="empty-state">
       <div class="glyph">◆</div>
-      <h3>Nenhum capítulo carregado</h3>
-      <p>Abra o menu (⚙) no canto superior esquerdo e envie o PDF do volume. O índice é ignorado e cada capítulo é separado automaticamente.</p>
+      <h1>Olá! Eu sou o Reader's Companion.</h1>
+      <p>Sou um motor de extração de PDF'S para facilitar a leitura dos mesmos. Conto com uma ferramenta para transformar os seus textos em podcasts!</p>
+       <p>Não vejo nenhum arquivo carregado no momento...</p>
+       <p>Abra o menu (⚙) no canto superior esquerdo e envie um arquivo em PDF do volume.<p>
     </div>
   </div>
 </div>
@@ -594,17 +596,45 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
     return lines;
   }
 
+  /* Rebuild a PDF visual line using horizontal geometry rather than join(' '). */
+  function reconstructLineText(parts){
+    if(!parts || !parts.length) return '';
+    const ordered=parts.filter(p=>p && typeof p.str==='string' && p.str.length).map(p=>{
+      const t=p.transform || [1,0,0,1,0,0];
+      const x=Number(t[4])||0;
+      let width=Number(p.width);
+      if(!Number.isFinite(width) || width<0){
+        const fs=Math.abs(Number(t[0]))||Math.abs(Number(t[3]))||Number(p.height)||12;
+        width=fs*0.5*p.str.length;
+      }
+      return {p,x,width};
+    }).sort((a,b)=>a.x-b.x);
+    if(!ordered.length) return '';
+    let result=ordered[0].p.str;
+    for(let i=1;i<ordered.length;i++){
+      const prev=ordered[i-1], cur=ordered[i];
+      const left=String(prev.p.str), right=String(cur.p.str);
+      if(/\s$/.test(left) || /^\s/.test(right)){ result+=right; continue; }
+      const gap=cur.x-(prev.x+prev.width);
+      const t=cur.p.transform || [1,0,0,1,0,0];
+      const fs=Math.abs(Number(t[0]))||Math.abs(Number(t[3]))||Number(cur.p.height)||Number(prev.p.height)||12;
+      const threshold=Math.max(1.0,fs*0.18);
+      if(gap>threshold && gap<Math.max(fs*1.5,threshold*4)) result+=' ';
+      result+=right;
+    }
+    return result;
+  }
+
   function markParagraphs(pageLines, previous){
     const out=[];
     let prev=previous || null;
     for(let i=0;i<pageLines.length;i++){
       const ln=pageLines[i];
-      const text=cleanText(ln.parts.map(x=>x.str).join(''));
+      const text=cleanText(reconstructLineText(ln.parts));
       if(!text) continue;
       let newParagraph=false;
       if(!prev) newParagraph=true;
       else if(ln.pageIndex!==prev.pageIndex){
-        // Page breaks do not imply paragraphs. Preserve continuation text.
         newParagraph=(ln.x-prev.x)>Math.max(8,ln.h*0.8);
       }else{
         const gap=Math.abs(prev.y-ln.y);
