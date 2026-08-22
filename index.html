@@ -837,6 +837,7 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
   /* ---------------- Speech ---------------- */
   const synth = window.speechSynthesis;
   let voices = [];
+  let queuedIdx = new Set(); // sentence indices already handed to the native queue for the current playToken
 
   function populateVoices(){
     voices = synth.getVoices();
@@ -872,37 +873,66 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
     playToken++;
     const myToken = playToken;
     synth.cancel();
+    queuedIdx = new Set();
     state.currentIdx = Math.max(0, Math.min(idx, state.flat.length - 1));
     state.speaking = true;
     state.paused = false;
     setPlayIcon(true);
     // Small delay after cancel() before speaking again — calling speak()
     // in the same tick as cancel() is unreliable in some browsers.
-    setTimeout(() => speakStep(myToken), 50);
+    setTimeout(() => speakStep(myToken, state.currentIdx), 50);
   }
 
-  function speakStep(token){
-    if(token !== playToken) return;
-    if(state.currentIdx >= state.flat.length){ onChapterFinished(); return; }
-    const item = state.flat[state.currentIdx];
-    highlightSentence(state.currentIdx);
+  // Builds one sentence's utterance. The key fix for the gap that used to
+  // appear before every new sentence: instead of waiting for this utterance
+  // to fully finish (onend) before even building the next one, we hand the
+  // *next* sentence's utterance to the browser's own speech queue as soon as
+  // this one starts (onstart). The native queue then chains straight from
+  // one utterance into the next with no round trip through our JS callbacks,
+  // which is what caused the audible pause. Highlighting/progress-saving
+  // moves to onstart too, so the UI updates exactly when each sentence
+  // actually begins.
+  function buildUtterance(token, idx){
+    const item = state.flat[idx];
     const utt = new SpeechSynthesisUtterance(item.text);
     const v = getSelectedVoice();
     if(v) utt.voice = v;
     utt.lang = v ? v.lang : 'pt-BR';
     utt.rate = parseFloat(els.rateSlider.value);
+
+    utt.onstart = () => {
+      if(token !== playToken) return;
+      state.currentIdx = idx;
+      highlightSentence(idx);
+      saveProgress();
+      const nextIdx = idx + 1;
+      if(nextIdx < state.flat.length && !queuedIdx.has(nextIdx)){
+        queuedIdx.add(nextIdx);
+        synth.speak(buildUtterance(token, nextIdx));
+      }
+    };
     utt.onend = () => {
       if(token !== playToken) return;
-      state.currentIdx++;
-      saveProgress();
-      speakStep(token);
+      if(idx >= state.flat.length - 1) onChapterFinished();
     };
     utt.onerror = () => {
       if(token !== playToken) return;
-      state.currentIdx++;
-      speakStep(token);
+      if(idx >= state.flat.length - 1){ onChapterFinished(); return; }
+      // Make sure playback still advances even if this sentence errored
+      // out before it had a chance to queue the one after it.
+      if(!queuedIdx.has(idx + 1)){
+        queuedIdx.add(idx + 1);
+        speakStep(token, idx + 1);
+      }
     };
-    synth.speak(utt);
+    return utt;
+  }
+
+  function speakStep(token, idx){
+    if(token !== playToken) return;
+    if(idx >= state.flat.length){ onChapterFinished(); return; }
+    queuedIdx.add(idx);
+    synth.speak(buildUtterance(token, idx));
   }
 
   function togglePlayPause(){
@@ -923,6 +953,7 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
   function stopSpeech(){
     playToken++;
     synth.cancel();
+    queuedIdx = new Set();
     state.speaking = false;
     state.paused = false;
     setPlayIcon(false);
@@ -956,7 +987,8 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
       deadTicks++;
       if(deadTicks >= 2){
         deadTicks = 0;
-        speakStep(playToken);
+        queuedIdx = new Set();
+        speakStep(playToken, state.currentIdx);
       }
     } else {
       deadTicks = 0;
