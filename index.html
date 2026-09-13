@@ -1307,4 +1307,668 @@ select:focus-visible, .slider:focus-visible, .text-btn:focus-visible{
     return idbOpen().then(db => new Promise((resolve, reject) => {
       let result;
       const tx = db.transaction(IDB_STORE, mode);
-      const stor... (24 KB restante(s))
+      const store = tx.objectStore(IDB_STORE);
+      try{ result = fn(store); }catch(e){ reject(e); return; }
+      tx.oncomplete = () => {
+        db.close();
+        resolve(result && typeof result === 'object' && 'result' in result ? result.result : result);
+      };
+      tx.onerror = () => { db.close(); reject(tx.error || new Error('transação')); };
+      tx.onabort = () => { db.close(); reject(tx.error || new Error('abortada')); };
+    }));
+  }
+
+  async function saveVolume(){
+    const payload = { volume: state.volume, volumeName: state.volumeName, savedAt: Date.now() };
+    try{
+      await idbRun('readwrite', store => store.put(payload, IDB_KEY));
+      try{ localStorage.removeItem(LS_VOLUME); }catch(e){}
+      return true;
+    }catch(e){
+      try{
+        localStorage.setItem(LS_VOLUME, JSON.stringify(payload));
+        return true;
+      }catch(e2){
+        return false;
+      }
+    }
+  }
+
+  async function loadVolume(){
+    try{
+      const got = await idbRun('readonly', store => store.get(IDB_KEY));
+      if(got && got.volume && got.volume.length) return got;
+    }catch(e){}
+    try{
+      const raw = localStorage.getItem(LS_VOLUME);
+      if(raw){
+        const data = JSON.parse(raw);
+        if(data && data.volume && data.volume.length) return data;
+      }
+    }catch(e){}
+    return null;
+  }
+
+  async function clearVolume(){
+    try{ await idbRun('readwrite', store => store.delete(IDB_KEY)); }catch(e){}
+    try{ localStorage.removeItem(LS_VOLUME); }catch(e){}
+  }
+
+  function saveProgress(){
+    try{
+      localStorage.setItem(LS_PROGRESS, JSON.stringify({
+        chapterIndex: state.chapterIndex,
+        currentIdx: state.currentIdx,
+        rate: els.rateSlider.value,
+        fontSize: els.fontSlider.value,
+        voiceURI: chosenVoiceURI
+      }));
+    }catch(e){}
+  }
+
+  function readProgress(){
+    try{
+      const raw = localStorage.getItem(LS_PROGRESS);
+      return raw ? JSON.parse(raw) : null;
+    }catch(e){ return null; }
+  }
+
+  async function loadPersisted(){
+    const progress = readProgress();
+    if(progress){
+      if(progress.rate){ els.rateSlider.value = progress.rate; }
+      if(progress.fontSize){ els.fontSlider.value = progress.fontSize; }
+      if(typeof progress.voiceURI === 'string') chosenVoiceURI = progress.voiceURI;
+      updateRateLabel();
+      updateFontSize();
+    }
+
+    const data = await loadVolume();
+    if(!data) return;
+
+    state.volume = data.volume;
+    state.volumeName = data.volumeName || '';
+    renderVolumeName();
+    renderChapterList();
+
+    const idx = progress && typeof progress.chapterIndex === 'number' ? progress.chapterIndex : 0;
+    goToChapter(idx, false);
+
+    if(progress && typeof progress.currentIdx === 'number' && state.flat.length){
+      setCursor(clamp(progress.currentIdx, 0, state.flat.length - 1), false);
+      const el = els.readerContent.querySelector('.sentence[data-gidx="' + state.currentIdx + '"]');
+      if(el) el.scrollIntoView({ block: 'center', behavior: 'auto' });
+    }
+    setStatus('Sessão restaurada — capítulo ' + (state.chapterIndex + 1) + ' de ' + state.volume.length, 'ok');
+  }
+
+  /* =========================================================================
+     Rendering
+     ========================================================================= */
+
+  function renderVolumeName(){
+    if(!state.volumeName){ els.volName.hidden = true; return; }
+    els.volName.hidden = false;
+    els.volNameText.textContent = state.volumeName;
+  }
+
+  function renderChapterList(){
+    if(!state.volume.length){ els.chapterListWrap.hidden = true; return; }
+    els.chapterListWrap.hidden = false;
+    let html = '';
+    state.volume.forEach((ch, i) => {
+      html += '<button type="button" class="chap-item' + (i === state.chapterIndex ? ' active' : '') + '" data-idx="' + i + '">'
+            + '<span class="chap-num">' + (i + 1) + '</span>'
+            + '<span class="chap-title">' + escapeHtml(ch.title) + '</span>'
+            + '</button>';
+    });
+    els.chapterList.innerHTML = html;
+    const active = els.chapterList.querySelector('.chap-item.active');
+    if(active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  els.chapterList.addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('.chap-item');
+    if(!btn) return;
+    const wasSpeaking = state.speaking && !state.paused;
+    goToChapter(parseInt(btn.getAttribute('data-idx'), 10), wasSpeaking);
+    closeDrawer();
+  });
+
+  function goToChapter(idx, autoplay){
+    if(!state.volume.length) return;
+    idx = clamp(idx, 0, state.volume.length - 1);
+    stopSpeech();
+    state.chapterIndex = idx;
+    const ch = state.volume[idx];
+    state.title = ch.title;
+    state.paragraphs = ch.paragraphs || [];
+    rebuildFlat();
+    state.currentIdx = 0;
+    cur = { sent: 0, chunk: 0 };
+    chapterDone = false;
+    renderChapter();
+    renderChapterList();
+    updateControls();
+    saveProgress();
+    if(autoplay) startSpeaking(0);
+  }
+
+  function rebuildFlat(){
+    state.flat = [];
+    state.paragraphs.forEach((arr, pi) => {
+      arr.forEach(text => state.flat.push({ text: text, paraIdx: pi, chunks: chunkSentence(text) }));
+    });
+  }
+
+  function renderChapter(){
+    let html = '';
+    if(state.volume.length > 1){
+      html += '<div class="chapter-counter">Capítulo ' + (state.chapterIndex + 1) + ' de ' + state.volume.length + '</div>';
+    }
+    html += '<h1 class="chapter-title">' + escapeHtml(state.title) + '</h1>';
+    html += '<div class="chapter-divider">◆</div>';
+    html += '<div class="chapter-body" id="chapterBody">';
+    let gidx = 0;
+    state.paragraphs.forEach(sentArr => {
+      html += '<p>';
+      sentArr.forEach(s => {
+        html += '<span class="sentence" data-gidx="' + gidx + '">' + escapeHtml(s) + ' </span>';
+        gidx++;
+      });
+      html += '</p>';
+    });
+    html += '</div>';
+    els.readerContent.innerHTML = html;
+    updateFontSize();
+    setCursor(state.currentIdx, false);
+  }
+
+  function setCursor(idx, scroll){
+    state.currentIdx = clamp(idx, 0, Math.max(0, state.flat.length - 1));
+    chapterDone = false;
+    const prev = els.readerContent.querySelector('.sentence.active');
+    if(prev){ prev.classList.remove('active'); prev.classList.remove('cursor'); }
+    const el = els.readerContent.querySelector('.sentence[data-gidx="' + state.currentIdx + '"]');
+    if(el){
+      el.classList.add('active');
+      if(!(state.speaking && !state.paused)) el.classList.add('cursor');
+      if(scroll) scrollIntoViewIfNeeded(el);
+    }
+    updateRibbon();
+  }
+
+  // Only scroll when the sentence is actually off-screen; scrolling on every
+  // sentence fought with the reader's own scrolling.
+  function scrollIntoViewIfNeeded(el){
+    const r = el.getBoundingClientRect();
+    const top = 90;
+    const bottom = window.innerHeight - 140;
+    if(r.top < top || r.bottom > bottom){
+      el.scrollIntoView({ block: 'center', behavior: reduceMotion ? 'auto' : 'smooth' });
+    }
+  }
+
+  function updateRibbon(){
+    if(!state.flat.length){ els.ribbon.style.width = '0%'; return; }
+    els.ribbon.style.width = (((state.currentIdx + 1) / state.flat.length) * 100) + '%';
+  }
+
+  function updateFontSize(){
+    document.documentElement.style.setProperty('--reading-size', els.fontSlider.value + 'px');
+    els.fontLabel.textContent = els.fontSlider.value + 'px';
+  }
+
+  function currentRate(){
+    const r = parseFloat(els.rateSlider.value);
+    return Number.isFinite(r) ? clamp(r, 0.5, 3) : 1;
+  }
+
+  function updateRateLabel(){
+    els.rateLabel.textContent = currentRate().toFixed(2).replace(/0$/, '') + 'x';
+  }
+
+  function updateControls(){
+    const has = state.flat.length > 0;
+    els.playBtn.disabled = !has;
+    els.prevBtn.disabled = !has;
+    els.nextBtn.disabled = !has;
+    els.prevChapterBtn.disabled = !state.volume.length || state.chapterIndex <= 0;
+    els.nextChapterBtn.disabled = !state.volume.length || state.chapterIndex >= state.volume.length - 1;
+  }
+
+  /* =========================================================================
+     Voices
+     ========================================================================= */
+
+  let voices = [];
+  let voiceSig = '';
+  let chosenVoiceURI = '';     // '' = let the engine pick
+
+  function buildVoiceOptions(){
+    const sel = els.voiceSelect;
+    const keep = chosenVoiceURI;
+    sel.innerHTML = '';
+
+    const def = document.createElement('option');
+    def.value = '';
+    def.textContent = 'Voz do sistema (padrão)';
+    sel.appendChild(def);
+
+    const pt = voices.filter(v => /^pt/i.test(v.lang || ''));
+    const rest = voices.filter(v => !/^pt/i.test(v.lang || ''));
+    const addGroup = (label, arr) => {
+      if(!arr.length) return;
+      const g = document.createElement('optgroup');
+      g.label = label;
+      arr.forEach(v => {
+        const o = document.createElement('option');
+        o.value = v.voiceURI;
+        o.textContent = v.name + ' (' + v.lang + ')' + (v.localService ? '' : ' · online');
+        g.appendChild(o);
+      });
+      sel.appendChild(g);
+    };
+    addGroup('Português', pt);
+    addGroup('Outros idiomas', rest);
+
+    // THE voice bug: this select used to be rebuilt on every onvoiceschanged
+    // event (Chrome and Edge fire it spontaneously, including when speech
+    // starts) and the chosen value was lost, so playback silently reverted to
+    // the default voice after the first sentence. The choice now lives in
+    // chosenVoiceURI and is restored on every rebuild.
+    sel.value = (keep && voices.some(v => v.voiceURI === keep)) ? keep : '';
+    chosenVoiceURI = sel.value;
+  }
+
+  function refreshVoices(){
+    if(!hasSpeech) return false;
+    let list = [];
+    try{ list = synth.getVoices() || []; }catch(e){ list = []; }
+    if(!list.length) return false;
+    voices = list;
+    const sig = list.map(v => v.voiceURI).join('|');
+    if(sig !== voiceSig){ voiceSig = sig; buildVoiceOptions(); }
+    return true;
+  }
+
+  function getSelectedVoice(){
+    if(!voices.length) return null;
+    if(chosenVoiceURI){
+      const hit = voices.find(v => v.voiceURI === chosenVoiceURI);
+      if(hit) return hit;
+    }
+    return voices.find(v => /^pt-BR/i.test(v.lang || ''))
+        || voices.find(v => /^pt/i.test(v.lang || ''))
+        || null;
+  }
+
+  if(hasSpeech){
+    synth.onvoiceschanged = refreshVoices;
+    // Chrome populates the list asynchronously and may never fire the event.
+    if(!refreshVoices()){
+      let tries = 0;
+      const poll = setInterval(() => {
+        if(refreshVoices() || ++tries > 20) clearInterval(poll);
+      }, 250);
+    }
+  }
+
+  els.voiceSelect.addEventListener('change', () => {
+    chosenVoiceURI = els.voiceSelect.value;
+    saveProgress();
+    // Utterances already handed to the engine keep the old voice, so restart
+    // the current sentence to make the change audible immediately.
+    if(state.speaking && !state.paused) startSpeaking(cur.sent);
+  });
+
+  /* =========================================================================
+     Speech engine
+     ========================================================================= */
+
+  function setPlayIcon(playing){
+    els.playBtn.textContent = playing ? '❚❚' : '▶';
+    els.playBtn.classList.toggle('speaking', playing);
+    els.playBtn.setAttribute('aria-label', playing ? 'Pausar' : 'Reproduzir');
+  }
+
+  function buildUtterance(token, sent, chunk){
+    const item = state.flat[sent];
+    if(!item) return null;
+    const text = item.chunks[chunk];
+    if(text == null) return null;
+
+    const utt = new SpeechSynthesisUtterance(text);
+    const v = getSelectedVoice();
+    // A voice object can go stale when the browser rebuilds its voice list,
+    // and assigning a stale one throws — which would abort playback entirely.
+    if(v){ try{ utt.voice = v; }catch(e){ console.warn("Reader's Companion voice:", e); } }
+    utt.lang = (v && v.lang) || 'pt-BR';
+    utt.rate = currentRate();
+
+    utt.onstart = () => {
+      if(token !== playToken) return;
+      lastActivity = Date.now();
+      errorStreak = 0;
+      if(chunk === 0){ setCursor(sent, true); saveProgress(); }
+    };
+    utt.onend = () => {
+      if(token !== playToken) return;
+      lastActivity = Date.now();
+      advance(token);
+    };
+    utt.onerror = (ev) => {
+      if(token !== playToken) return;
+      const err = ev && ev.error;
+      if(err === 'interrupted' || err === 'canceled') return;   // our own cancel()
+      lastActivity = Date.now();
+      console.warn("Reader's Companion speech error:", err);
+      // Without this brake, an engine that fails every utterance (a browser
+      // with no voices installed) would race silently through the whole
+      // chapter one error at a time.
+      if(++errorStreak >= 3){
+        stopSpeech();
+        announce(voices.length
+          ? 'A narração falhou neste navegador (' + (err || 'erro desconhecido') + '). Tente outra voz.'
+          : 'Nenhuma voz de síntese disponível neste navegador.', 'err', 9000);
+        return;
+      }
+      advance(token);
+    };
+    return utt;
+  }
+
+  function speakUtterance(utt){
+    if(!utt) return;
+    try{ synth.speak(utt); }
+    catch(e){
+      console.error("Reader's Companion speak():", e);
+      stopSpeech();
+      announce('Não foi possível iniciar a narração neste navegador.', 'err', 8000);
+    }
+  }
+
+  // The previous version handed the NEXT sentence to the engine inside
+  // onstart of the current one. Chaining utterances that way makes Chrome and
+  // Edge clip the first word or two of each new utterance — the "narração pula
+  // as primeiras palavras" symptom. Speaking from onend instead costs a barely
+  // perceptible pause and never loses audio.
+  function advance(token){
+    const item = state.flat[cur.sent];
+    if(item && cur.chunk + 1 < item.chunks.length){
+      cur.chunk++;
+    } else if(cur.sent + 1 < state.flat.length){
+      cur.sent++;
+      cur.chunk = 0;
+    } else {
+      onChapterFinished();
+      return;
+    }
+    speakUtterance(buildUtterance(token, cur.sent, cur.chunk));
+  }
+
+  function startSpeaking(sentIdx){
+    if(!hasSpeech){ announce('Este navegador não oferece síntese de voz.', 'err'); return; }
+    if(!state.flat.length) return;
+
+    const wasBusy = synth.speaking || synth.pending || synth.paused;
+    playToken++;
+    const token = playToken;
+
+    // cancel() while the engine is paused wedges it in Chrome: resume first.
+    if(synth.paused){ try{ synth.resume(); }catch(e){} }
+    try{ synth.cancel(); }catch(e){}
+
+    cur = { sent: clamp(sentIdx, 0, state.flat.length - 1), chunk: 0 };
+    state.speaking = true;
+    state.paused = false;
+    chapterDone = false;
+    lastActivity = Date.now();
+    errorStreak = 0;
+    setPlayIcon(true);
+    setCursor(cur.sent, true);
+
+    const fire = () => {
+      if(token !== playToken) return;
+      speakUtterance(buildUtterance(token, cur.sent, cur.chunk));
+    };
+
+    // Speaking synchronously keeps us inside the user-gesture task, which is
+    // what iOS Safari requires — the old unconditional setTimeout meant iPhone
+    // and iPad produced no audio at all. A short delay is only needed when we
+    // just cancelled something.
+    if(wasBusy) setTimeout(fire, 40);
+    else fire();
+  }
+
+  function stopSpeech(){
+    playToken++;
+    if(hasSpeech){
+      try{ if(synth.paused) synth.resume(); }catch(e){}
+      try{ synth.cancel(); }catch(e){}
+    }
+    state.speaking = false;
+    state.paused = false;
+    setPlayIcon(false);
+  }
+
+  function togglePlayPause(){
+    if(!state.flat.length){
+      announce('Envie um PDF para começar.', 'err');
+      return;
+    }
+    if(state.speaking && !state.paused){
+      if(isApple){
+        // pause()/resume() are unreliable on iOS: stop and remember the spot.
+        playToken++;
+        try{ synth.cancel(); }catch(e){}
+      } else {
+        try{ synth.pause(); }catch(e){}
+      }
+      state.paused = true;
+      setPlayIcon(false);
+      setCursor(state.currentIdx, false);
+      saveProgress();
+      return;
+    }
+    if(state.speaking && state.paused){
+      if(!isApple && synth.paused){
+        try{ synth.resume(); }catch(e){}
+        state.paused = false;
+        setPlayIcon(true);
+        setCursor(state.currentIdx, false);
+      } else {
+        startSpeaking(cur.sent);
+      }
+      return;
+    }
+    // Finished the volume: ▶ used to replay only the very last sentence.
+    startSpeaking(chapterDone ? 0 : state.currentIdx);
+  }
+
+  // Moving the reading position only produces audio when audio was already
+  // playing, so arrow keys no longer start narration on their own while
+  // someone is reading silently.
+  function moveTo(idx, scroll){
+    if(!state.flat.length) return;
+    const next = clamp(idx, 0, state.flat.length - 1);
+    if(state.speaking && !state.paused){ startSpeaking(next); return; }
+    // While paused, the engine still holds the old sentence: drop it so that
+    // pressing play resumes at the new position instead of the previous one.
+    if(state.paused && hasSpeech){
+      playToken++;
+      try{ if(synth.paused) synth.resume(); }catch(e){}
+      try{ synth.cancel(); }catch(e){}
+    }
+    cur = { sent: next, chunk: 0 };
+    setCursor(next, scroll);
+    saveProgress();
+  }
+
+  function step(delta){ moveTo(state.currentIdx + delta, true); }
+
+  function onChapterFinished(){
+    state.speaking = false;
+    state.paused = false;
+    setPlayIcon(false);
+    if(state.chapterIndex < state.volume.length - 1){
+      announce('Avançando para o próximo capítulo…', 'ok', 2200);
+      goToChapter(state.chapterIndex + 1, true);
+    } else {
+      // setCursor clears chapterDone, so it has to run first.
+      setCursor(state.flat.length - 1, false);
+      chapterDone = true;
+      els.ribbon.style.width = '100%';
+      announce('Fim do volume — você concluiu todos os capítulos.', 'ok', 6000);
+    }
+  }
+
+  // Watchdog: some engines die mid-chapter without firing onend or onerror.
+  // If we believe we are speaking but nothing has happened for a while,
+  // re-issue the current chunk.
+  setInterval(() => {
+    if(!hasSpeech || !state.speaking || state.paused) return;
+    if(synth.speaking || synth.pending) return;
+    if(Date.now() - lastActivity < 4000) return;
+    lastActivity = Date.now();
+    speakUtterance(buildUtterance(playToken, cur.sent, cur.chunk));
+  }, 1500);
+
+  // Some browsers auto-pause when the tab is backgrounded or the screen locks.
+  document.addEventListener('visibilitychange', () => {
+    if(document.visibilityState !== 'visible') return;
+    if(!hasSpeech || !state.speaking || state.paused) return;
+    if(synth.paused){ try{ synth.resume(); }catch(e){} }
+  });
+
+  /* =========================================================================
+     Reading-position navigation: click and text selection
+     ========================================================================= */
+
+  function sentenceAncestor(node){
+    let n = node;
+    while(n && n !== els.readerContent){
+      if(n.nodeType === 1 && n.classList && n.classList.contains('sentence')) return n;
+      n = n.parentNode;
+    }
+    return null;
+  }
+
+  els.readerContent.addEventListener('click', (e) => {
+    const sel = window.getSelection && window.getSelection();
+    if(sel && !sel.isCollapsed) return;          // this click ended a selection
+    const el = e.target.closest && e.target.closest('.sentence');
+    if(!el) return;
+    const idx = parseInt(el.getAttribute('data-gidx'), 10);
+    if(Number.isNaN(idx)) return;
+    startSpeaking(idx);
+  });
+
+  function handleSelection(){
+    setTimeout(() => {
+      const sel = window.getSelection && window.getSelection();
+      if(!sel || sel.isCollapsed || !sel.rangeCount) return;
+      const range = sel.getRangeAt(0);
+      if(!els.readerContent.contains(range.startContainer)
+        && !els.readerContent.contains(range.commonAncestorContainer)) return;
+
+      let el = sentenceAncestor(range.startContainer);
+      if(!el){
+        // Selection began on the whitespace between two spans: take the first
+        // sentence the range actually touches.
+        const all = els.readerContent.querySelectorAll('.sentence');
+        for(let i = 0; i < all.length; i++){
+          if(range.intersectsNode(all[i])){ el = all[i]; break; }
+        }
+      }
+      if(!el) return;
+      const idx = parseInt(el.getAttribute('data-gidx'), 10);
+      if(Number.isNaN(idx) || idx === state.currentIdx) return;
+
+      const wasPlaying = state.speaking && !state.paused;
+      moveTo(idx, false);             // jumps the narration if it was playing
+      if(!wasPlaying) toast('Leitura posicionada aqui — ▶ para continuar.', 'ok', 2600);
+    }, 0);
+  }
+
+  document.addEventListener('mouseup', handleSelection);
+  document.addEventListener('touchend', handleSelection);
+
+  /* =========================================================================
+     Controls & keyboard
+     ========================================================================= */
+
+  els.playBtn.addEventListener('click', togglePlayPause);
+  els.prevBtn.addEventListener('click', () => step(-1));
+  els.nextBtn.addEventListener('click', () => step(1));
+  els.prevChapterBtn.addEventListener('click', () => goToChapter(state.chapterIndex - 1, state.speaking && !state.paused));
+  els.nextChapterBtn.addEventListener('click', () => goToChapter(state.chapterIndex + 1, state.speaking && !state.paused));
+
+  els.rateSlider.addEventListener('input', updateRateLabel);
+  els.rateSlider.addEventListener('change', () => {
+    updateRateLabel();
+    saveProgress();
+    if(state.speaking && !state.paused) startSpeaking(cur.sent);
+  });
+
+  els.fontSlider.addEventListener('input', updateFontSize);
+  els.fontSlider.addEventListener('change', () => { updateFontSize(); saveProgress(); });
+
+  els.resetBtn.addEventListener('click', async () => {
+    stopSpeech();
+    await clearVolume();
+    try{ localStorage.removeItem(LS_PROGRESS); }catch(e){}
+    location.reload();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if(e.key === 'Escape'){ if(drawerIsOpen()) closeDrawer(); return; }
+    if(e.ctrlKey || e.metaKey || e.altKey) return;
+
+    const t = e.target;
+    const tag = (t && t.tagName) || '';
+    if(tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+
+    switch(e.key){
+      case ' ':
+      case 'Spacebar':
+        // Let a focused button handle its own activation instead of toggling twice.
+        if(tag === 'BUTTON') return;
+        e.preventDefault();
+        togglePlayPause();
+        break;
+      case 'ArrowLeft':
+        e.preventDefault(); step(-1); break;
+      case 'ArrowRight':
+        e.preventDefault(); step(1); break;
+      case '[':
+        if(state.chapterIndex > 0) goToChapter(state.chapterIndex - 1, state.speaking && !state.paused);
+        break;
+      case ']':
+        if(state.chapterIndex < state.volume.length - 1) goToChapter(state.chapterIndex + 1, state.speaking && !state.paused);
+        break;
+      case 'm':
+      case 'M':
+        toggleDrawer(); break;
+    }
+  });
+
+  window.addEventListener('beforeunload', () => { try{ synth && synth.cancel(); }catch(e){} });
+
+  /* =========================================================================
+     Init
+     ========================================================================= */
+
+  updateRateLabel();
+  updateFontSize();
+  updateControls();
+  setPlayIcon(false);
+
+  loadPersisted()
+    .then(() => updateControls())
+    .catch(err => console.error("Reader's Companion restore:", err));
+
+})();
+</script>
+</body>
+</html>
